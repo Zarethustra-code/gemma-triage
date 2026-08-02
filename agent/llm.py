@@ -1,19 +1,25 @@
 """Gemma 4 backend abstraction.
 
 One class, :class:`GemmaLLM`, with one method, :meth:`GemmaLLM.generate`. Three
-interchangeable backends sit behind it, selected by the ``GEMMA_BACKEND`` env var
-and tried in this order when it is ``auto`` (the default):
+interchangeable backends sit behind it, selected by the ``GEMMA_BACKEND`` env var:
 
-    1. ``transformers``  -- Gemma 4 running locally, on-device. The real product.
-    2. ``hf_api``        -- Gemma 4 hosted via the Hugging Face Inference API.
+    1. ``transformers``  -- Gemma 4 running locally, on-device. Email content stays
+                            on this machine. The real product.
+    2. ``hf_api``        -- Gemma 4 hosted via the Hugging Face Inference API. Email
+                            content is sent to an external provider.
     3. ``heuristic``     -- a dependency-free keyword engine honouring the same
-                            JSON contract, so the demo can never hard-fail.
+                            JSON contract, so the demo can never hard-fail. Local.
+
+``auto`` (the default) tries ``transformers`` and then ``heuristic``. It reaches the
+hosted tier **only** when ``ALLOW_REMOTE_INFERENCE=true``; otherwise nothing ever
+leaves the device without the operator having asked for it in so many words. Naming
+``hf_api`` explicitly is itself that request, and is always honoured.
 
 The heuristic tier is deliberately not a mock: it returns schema-valid output for
 both prompt types, which means the UI, the tool executor and the test suite all
 exercise the same code paths whether or not model weights are present.
 :attr:`active_backend` is surfaced in the UI so a viewer always knows which engine
-produced what they are looking at.
+produced what they are looking at, and whether it ran here or elsewhere.
 """
 
 from __future__ import annotations
@@ -39,6 +45,16 @@ VALID_BACKENDS = ("auto", "transformers", "hf_api", "heuristic")
 #: After this many consecutive generation failures, drop to the heuristic tier
 #: permanently rather than paying for a failing round trip on every email.
 MAX_CONSECUTIVE_FAILURES = 2
+
+
+def remote_inference_allowed() -> bool:
+    """True when hosted (off-device) inference is explicitly permitted.
+
+    Read at construction time, not import time, so a test or a Space can set
+    ``ALLOW_REMOTE_INFERENCE`` and rebuild the engine. Defaults to ``false``:
+    ``auto`` must never reach for a remote provider on its own.
+    """
+    return os.getenv("ALLOW_REMOTE_INFERENCE", "false").strip().lower() == "true"
 
 
 class GemmaLLM:
@@ -78,6 +94,12 @@ class GemmaLLM:
         self._degraded: bool = False
         self._consecutive_failures: int = 0
 
+        #: Off-device inference is opt-in. `auto` never reaches for it on its own.
+        self.allow_remote: bool = remote_inference_allowed()
+
+        #: Chat-template message shape known to work (cached after first success).
+        self._chat_shape_index: Optional[int] = None
+
         self._active_backend: str = self._resolve_backend(requested)
 
     # ------------------------------------------------------------------
@@ -91,16 +113,21 @@ class GemmaLLM:
 
     @property
     def is_local(self) -> bool:
-        """True when inference happens on this device (nothing leaves the machine)."""
+        """True when inference runs on this device, so email content stays here."""
         return self._active_backend in ("transformers", "heuristic")
+
+    @property
+    def is_remote(self) -> bool:
+        """True when email content is sent to an external inference provider."""
+        return self._active_backend == "hf_api"
 
     @property
     def backend_label(self) -> str:
         """Short description for the UI status bar."""
         labels = {
             "transformers": f"Gemma 4 on-device ({self.model_id}, transformers)",
-            "hf_api": f"Gemma 4 via Hugging Face Inference API ({self.model_id})",
-            "heuristic": "Heuristic fallback engine (no Gemma weights loaded)",
+            "hf_api": f"REMOTE — Gemma 4 via the Hugging Face Inference API ({self.model_id})",
+            "heuristic": "Heuristic fallback engine, on-device (no Gemma weights loaded)",
         }
         label = labels.get(self._active_backend, self._active_backend)
         if self._degraded:
@@ -108,16 +135,36 @@ class GemmaLLM:
         return label
 
     def _resolve_backend(self, requested: str) -> str:
-        """Pick a backend, honouring an explicit request and falling back sanely."""
+        """Pick a backend, honouring an explicit request and falling back sanely.
+
+        Hosted inference is never chosen implicitly. ``auto`` walks
+        ``transformers -> heuristic`` unless ``ALLOW_REMOTE_INFERENCE=true``, in which
+        case ``hf_api`` is inserted between them. Asking for ``hf_api`` by name is an
+        explicit, informed choice and is always honoured.
+        """
         if requested == "heuristic":
             self.notes.append("Heuristic backend requested explicitly.")
             return "heuristic"
 
-        order = (
-            [requested]
-            if requested in ("transformers", "hf_api")
-            else ["transformers", "hf_api"]
-        )
+        if requested in ("transformers", "hf_api"):
+            order = [requested]
+            if requested == "hf_api":
+                self.notes.append(
+                    "Hosted backend requested explicitly — email content will be sent to "
+                    "the configured external inference provider."
+                )
+        else:
+            order = ["transformers"]
+            if self.allow_remote:
+                order.append("hf_api")
+                self.notes.append(
+                    "ALLOW_REMOTE_INFERENCE=true — `auto` may fall back to hosted inference."
+                )
+            else:
+                self.notes.append(
+                    "Remote inference is disabled (ALLOW_REMOTE_INFERENCE is not 'true'), "
+                    "so `auto` resolves on-device only: transformers, then heuristic."
+                )
 
         for name in order:
             ok = self._try_init_transformers() if name == "transformers" else self._try_init_hf_api()
@@ -156,32 +203,36 @@ class GemmaLLM:
         if processor is None:
             return False
 
-        load_kwargs: Dict[str, Any] = {"device_map": os.environ.get("GEMMA_DEVICE", "auto")}
+        # `dtype` replaced `torch_dtype` in recent transformers, and old builds reject
+        # the new name while new builds warn on the old one. Try both before giving up
+        # on half precision, then device_map alone, then bare defaults.
+        device_map = os.environ.get("GEMMA_DEVICE", "auto")
+        load_attempts: List[Dict[str, Any]] = []
         try:
             import torch
 
-            # `dtype` replaced `torch_dtype` in recent transformers; try the new name
-            # first and let the retry loop below handle older builds.
-            load_kwargs["dtype"] = torch.bfloat16
-        except Exception:  # noqa: BLE001 - pragma: no cover
+            for dtype_kw in ("dtype", "torch_dtype"):
+                load_attempts.append({"device_map": device_map, dtype_kw: torch.bfloat16})
+        except Exception:  # noqa: BLE001
             pass
+        load_attempts.append({"device_map": device_map})
+        load_attempts.append({})
 
         for class_name in _MODEL_CLASS_CANDIDATES:
             klass = getattr(transformers, class_name, None)
             if klass is None:
                 continue
-            for kwargs in (load_kwargs, {"device_map": load_kwargs.get("device_map", "auto")}, {}):
+            for kwargs in load_attempts:
                 try:
                     self._model = klass.from_pretrained(self.model_id, **kwargs)
                     self._processor = processor
                     self.notes.append(f"Loaded {self.model_id} with {class_name}.")
                     return True
                 except TypeError:
-                    continue  # unsupported kwarg on this transformers version
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     self.notes.append(f"{class_name} could not load {self.model_id}: {exc}")
                     break
-
         return False
 
     def _try_init_hf_api(self) -> bool:
@@ -245,36 +296,15 @@ class GemmaLLM:
     # ------------------------------------------------------------------
 
     def _generate_transformers(self, system: str, user: str) -> str:
-        messages = [
-            {"role": "system", "content": [{"type": "text", "text": system}]},
-            {"role": "user", "content": [{"type": "text", "text": user}]},
-        ]
+        import torch
 
-        try:
-            inputs = self._processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-        except (TypeError, ValueError):
-            # Tokenizer-only checkpoints: flatten the multimodal content blocks.
-            flat = [
-                {"role": m["role"], "content": m["content"][0]["text"]} for m in messages
-            ]
-            text = self._processor.apply_chat_template(
-                flat, add_generation_prompt=True, tokenize=False
-            )
-            inputs = self._processor(text, return_tensors="pt")
+        inputs = self._build_chat_inputs(system, user)
 
         device = getattr(self._model, "device", None)
         if device is not None and hasattr(inputs, "to"):
             inputs = inputs.to(device)
 
         prompt_len = int(inputs["input_ids"].shape[-1])
-
-        import torch
 
         with torch.inference_mode():
             output = self._model.generate(
@@ -287,22 +317,87 @@ class GemmaLLM:
         decoder = getattr(self._processor, "decode", None) or self._processor.tokenizer.decode
         return decoder(new_tokens, skip_special_tokens=True).strip()
 
-    def _generate_hf_api(self, system: str, user: str) -> str:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+    @staticmethod
+    def _chat_shapes(system: str, user: str) -> List[List[Dict[str, Any]]]:
+        """Message shapes to probe, richest first.
+
+        Chat templates disagree about two things: whether ``system`` is a role at all,
+        and whether ``content`` may be a list of typed blocks. The last shape folds the
+        system turn into the user turn, which every Gemma template accepts — so the
+        local backend degrades to a different prompt shape, never to the heuristic.
+        """
+        folded = f"{system}\n\n{user}"
+        return [
+            [
+                {"role": "system", "content": [{"type": "text", "text": system}]},
+                {"role": "user", "content": [{"type": "text", "text": user}]},
+            ],
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            [{"role": "user", "content": [{"type": "text", "text": folded}]}],
+            [{"role": "user", "content": folded}],
         ]
+
+    def _build_chat_inputs(self, system: str, user: str):
+        """Tokenise one turn, caching the first message shape the template accepts."""
+        shapes = self._chat_shapes(system, user)
+        order = (
+            [self._chat_shape_index]
+            if self._chat_shape_index is not None
+            else list(range(len(shapes)))
+        )
+        for i in order:
+            try:
+                inputs = self._processor.apply_chat_template(
+                    shapes[i],
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                if self._chat_shape_index is None:
+                    self._chat_shape_index = i
+                    if i > 0:
+                        self.notes.append(
+                            f"Chat template needed shape #{i} (system folded into the user turn)."
+                        )
+                return inputs
+            except Exception:  # noqa: BLE001
+                continue
+        if self._chat_shape_index is not None:
+            # The cached shape stopped working; forget it and re-probe from scratch.
+            self._chat_shape_index = None
+            return self._build_chat_inputs(system, user)
+        return self._processor(f"{system}\n\n{user}", return_tensors="pt")
+
+    def _generate_hf_api(self, system: str, user: str) -> str:
         try:
             response = self._client.chat_completion(
-                messages=messages,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
                 max_tokens=self.max_new_tokens,
-                temperature=0.1,
+                temperature=0.0,  # deterministic: triage should be reproducible
             )
             return (response.choices[0].message.content or "").strip()
-        except (AttributeError, NotImplementedError):
-            # Older/newer client surfaces: fall back to raw text generation.
+        except Exception:  # noqa: BLE001
+            pass
+        # Some providers reject a separate system role outright. Fold and retry.
+        try:
+            response = self._client.chat_completion(
+                messages=[{"role": "user", "content": f"{system}\n\n{user}"}],
+                max_tokens=self.max_new_tokens,
+                temperature=0.0,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception:  # noqa: BLE001
             prompt = f"{system}\n\n{user}\n"
-            return str(self._client.text_generation(prompt, max_new_tokens=self.max_new_tokens)).strip()
+            return str(
+                self._client.text_generation(prompt, max_new_tokens=self.max_new_tokens)
+            ).strip()
 
 
 # =====================================================================

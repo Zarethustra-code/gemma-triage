@@ -1,6 +1,6 @@
 # Gemma-Triage — Smart Email Agent & Workflow Automator
 
-### The inbox agent that never sends your email to the cloud, because Gemma 4 fits on your laptop.
+### The inbox agent that doesn't need the cloud, because Gemma 4 fits on your laptop.
 
 **Track: Local Frontier Innovation**
 
@@ -25,7 +25,11 @@ permitted to make. They are locked out of the productivity gain entirely.
 
 ## The solution
 
-**Gemma-Triage is a complete email agent that runs on your own device.**
+**Gemma-Triage is a complete email agent built to run on your own device.**
+
+Gemma-Triage supports fully local email processing through the Transformers backend. When
+hosted inference is enabled, email content may be sent to the configured external inference
+provider. The active processing mode is always shown in the interface.
 
 For every message in an inbox it performs four jobs in a single pass:
 
@@ -33,18 +37,19 @@ For every message in an inbox it performs four jobs in a single pass:
    priority score.
 2. **Summarises** — one sentence that states the *ask*, not the topic.
 3. **Drafts a reply** — a ready-to-review body, in a tone the model itself selected.
-4. **Extracts and executes follow-ups** — tasks and calendar events, emitted as real tool
-   calls and executed into validated Google Tasks / Google Calendar payloads.
+4. **Extracts and prepares follow-ups** — tasks and calendar entries, emitted as real tool
+   calls and turned into validated Google Tasks / Google Calendar payloads for review.
 
 Then it re-sorts the inbox so what matters is at the top. You open the app and see: two
 things are on fire, five need you this week, five don't need you at all — and here are the
 drafts and the calendar entries, already written.
 
 **This hits two Gemma 4 pillars at once.** *Edge & Offline Intelligence*: the whole agent
-runs on-device on Gemma 4 E4B, so email never leaves the machine. *Agentic Workflows*: native
-function calling turns reading email into finished work rather than more reading. Neither
-half works without the other — a cloud agent can't have the privacy, and a local classifier
-without tool use is just a smarter spam filter.
+fits on-device on Gemma 4 E4B, so the private deployment is the default one rather than a
+paid tier — run the Transformers backend and email content stays on the machine.
+*Agentic Workflows*: native function calling turns reading email into prepared work rather
+than more reading. Neither half works without the other — a cloud-only agent can't have the
+privacy, and a local classifier without tool use is just a smarter spam filter.
 
 ## How Gemma 4 is used
 
@@ -58,9 +63,12 @@ strict JSON object**. Gemma's output *is* the data structure the rest of the app
 
 **Native function calling as the action layer.** Gemma 4 decides *which* of four tools to
 call and *with what arguments*: `draft_reply{tone}`, `create_task{title, due}`,
-`create_calendar_event{title, date, time}`, `flag_urgent{reason}`. `agent/tools.py` then
-executes them for real — tasks and events emerge as payloads already shaped for the Google
-Tasks and Google Calendar REST APIs.
+`create_calendar_event{title, date, time}`, `flag_urgent{reason}`. `agent/tools.py` then runs
+them — tasks and events emerge as **prepared payloads**, already shaped for the Google Tasks
+and Google Calendar REST APIs and waiting on a human. Preparing a payload is not the same as
+creating a remote record, and the app never conflates the two: actions carry an explicit
+status through *Suggested action → Prepared payload → Approved → Created (external) →
+Failed*, and nothing this layer produces can reach "Created (external)".
 
 **Gemma calls itself.** `draft_reply` is not a template. It fires **a second Gemma 4
 generation** using `prompts/reply_prompt.txt` and the tone the model chose in step one. That
@@ -71,9 +79,11 @@ in service of that tool → return a result*.
 quoted history, forwarded chains — goes in whole. No chunking, no retrieval, no lost context.
 
 **Edge-sized on purpose.** E4B is the entire point. A model this capable that fits on a
-laptop is what turns "your email never leaves your device" from a promise into an
-engineering fact. `google/gemma-4-E2B-it` covers tighter hardware; the README documents GGUF
-(llama.cpp) and LiteRT paths for quantised CPU and mobile deployment.
+laptop is what turns "email content stays on the device" from a promise into an engineering
+fact — provided you run it locally, which is why the app names the active backend at all
+times instead of asking anyone to take that on trust. `google/gemma-4-E2B-it` covers tighter
+hardware; the README documents GGUF (llama.cpp) and LiteRT paths for quantised CPU and mobile
+deployment.
 
 ## Architecture
 
@@ -102,11 +112,22 @@ engineering fact. `google/gemma-4-E2B-it` covers tighter hardware; the README do
                  │
                  ▼
         sort: URGENT / high-priority first  →  Gradio dashboard
+                 │
+                 ╎  human edits the reply and clicks "Create Gmail Draft"
+                 ▼
+          Gmail draft — created, never sent
 ```
 
-A three-tier backend ladder sits behind one interface (`GemmaLLM.generate`):
-`transformers` (Gemma 4 on-device) → `hf_api` (Gemma 4 hosted) → `heuristic` (keyword engine,
-no model). The active tier is always displayed in the app's status bar.
+Everything above the dashed line is automatic and has no effect outside the process. The
+dashed step is the only one that writes anywhere else, and it requires a click.
+
+Three backends sit behind one interface (`GemmaLLM.generate`): `transformers` (Gemma 4
+on-device), `hf_api` (Gemma 4 hosted), and `heuristic` (keyword engine, no model). **`auto`
+resolves `transformers → heuristic` — both on-device.** It only considers the hosted tier
+when `ALLOW_REMOTE_INFERENCE=true`; naming `hf_api` outright is itself that permission. A
+fallback can degrade reasoning quality without being asked, but it can never quietly change
+*where* email is processed. The active tier, and whether processing is **LOCAL** or
+**REMOTE**, is always displayed in the app's status bar.
 
 ## Agentic workflow walkthrough
 
@@ -125,7 +146,8 @@ the slot works and I'll send the video link."*
 5. **The UI** shows the badge, priority, summary, Gemma's reasoning, an editable draft, and
    cards for the task and the event.
 
-One email in — a verdict, a summary, a draft and two scheduled artefacts out.
+One email in — a verdict, a summary, a draft and two prepared artefacts out, none of them
+acted on until the user says so.
 
 ## Challenges
 
@@ -150,8 +172,23 @@ in the subject or an explicit time, spam can never receive a drafted reply — e
 validation, not merely requested in the prompt — and every tool call is individually wrapped
 so one failure becomes a visible error card instead of a dead run.
 
+**Treating email as attacker-controlled text.** An email body is written by someone else, so
+asking the model politely to ignore instructions hidden in it is necessary but not
+sufficient. `prompts/triage_prompt.txt` names the attack explicitly — never change role,
+override the schema, enable unavailable tools, reveal configuration, send anything, or act
+without approval — and every one of those rules is *also* enforced in code, where an obedient
+model cannot undo it: a tool allow-list, a per-tool argument allow-list that discards
+smuggled fields, a hard `MAX_ACTIONS_PER_EMAIL` cap, refusal of calendar events without a
+resolvable date and drafts without a valid recipient, and no send path in the codebase at
+all. `msg-013` in the demo inbox is a real procurement request with an injected `###SYSTEM###`
+block demanding the `.env` contents, ten calendar events and an automatic send; it is triaged
+as an ordinary `ACTION_NEEDED` email with two sanctioned actions and no secrets. Tests fail if
+that stops being true.
+
 **Never sending anything.** The Gmail scopes are `gmail.readonly` and `gmail.compose`. There
-is no send scope. Drafts, tasks and events are suggestions; a human always presses send.
+is no send scope, and no `send` call exists anywhere in the connector — a test parses the
+module to prove it. Tasks and events stop at a prepared payload. A Gmail draft is created only
+when a human edits a reply and presses the button, and even then it lands in Drafts, unsent.
 
 ## Impact
 
@@ -160,11 +197,13 @@ roughly an hour daily spent deciding rather than doing. Gemma-Triage collapses t
 into one keypress and converts the deciding into artefacts — drafts, tasks, events — that
 would otherwise have been a second pass of work.
 
-The bigger point is *who it unlocks*. This is not a cheaper email assistant; it is the first
-one that a clinic, a law firm, a newsroom or a compliance team can actually run, because the
-data never moves. It also works on a plane, in a hospital basement, and in any region where
-sending correspondence offshore is illegal. Gemma 4 at the edge is what makes that class of
-user reachable at all.
+The bigger point is *who it unlocks*. This is not a cheaper email assistant; it is one that a
+clinic, a law firm, a newsroom or a compliance team can actually run, because on the
+Transformers backend the data does not move. It also works on a plane, in a hospital
+basement, and in any region where sending correspondence offshore is illegal. Gemma 4 at the
+edge is what makes that class of user reachable at all — and the app states which backend is
+live on every screen, so the guarantee is one they can verify rather than one they must
+believe.
 
 ## What's next
 

@@ -1,6 +1,7 @@
 """Gemma-Triage agent package.
 
-A privacy-first, on-device email triage agent built on Gemma 4.
+A local-first email triage agent built on Gemma 4. The Transformers backend keeps
+email content on the user's device; hosted inference is opt-in and always labelled.
 
 Public surface:
     GemmaLLM        -- backend abstraction over Gemma 4 (transformers / hf_api / heuristic)

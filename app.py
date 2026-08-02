@@ -2,8 +2,10 @@
 
 Entry point for both local runs and the Hugging Face Space. The app opens straight
 into a working demo inbox: no login, no token, no model download required. If Gemma 4
-weights or a Hugging Face token are present the app uses them and says so in the
-status bar; if not, it falls back to the heuristic engine and says that instead.
+weights are present the app uses them and says so in the status bar; if not, it falls
+back to the heuristic engine and says that instead. Hosted inference is only ever used
+when ``ALLOW_REMOTE_INFERENCE=true`` or the ``hf_api`` backend is named outright, and
+the status bar says plainly when processing is happening off this device.
 
 Run:  python app.py
 """
@@ -26,6 +28,7 @@ _LAUNCH_PARAMS = set(inspect.signature(gr.Blocks.launch).parameters)
 _STYLE_ON_LAUNCH = {"css", "theme"} <= _LAUNCH_PARAMS
 
 from agent import GemmaLLM, TriageAgent
+from agent.tools import STATUS_APPROVED, STATUS_CREATED, STATUS_FAILED, STATUS_PREPARED
 from agent.triage import ProcessedEmail, inbox_stats, sort_results
 
 APP_DIR = Path(__file__).resolve().parent
@@ -62,6 +65,11 @@ CUSTOM_CSS = """
 }
 .gt-card-title { font-weight:600; font-size:13px; }
 .gt-card-detail { font-size:12.5px; opacity:.8; margin-top:3px; }
+.gt-status {
+  display:inline-block; padding:1px 8px; border-radius:999px; font-size:10.5px;
+  font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+  border:1px solid currentColor; opacity:.75; white-space:nowrap; margin-left:4px;
+}
 .gt-section { font-size:11px; font-weight:700; letter-spacing:.08em;
   text-transform:uppercase; opacity:.6; margin:16px 0 4px; }
 .gt-quote {
@@ -129,23 +137,45 @@ def status_bar_html() -> str:
         )
 
     if llm.active_backend == "transformers":
-        icon, note = "🟢", "Fully on-device. No email data leaves this machine."
+        icon, lock, note = (
+            "🟢",
+            "🔒",
+            "LOCAL processing — Gemma 4 runs on this device, so email content stays here.",
+        )
     elif llm.active_backend == "hf_api":
-        icon, note = (
+        icon, lock, note = (
             "🟡",
-            "Gemma 4 is hosted on Hugging Face for this session — set up the local "
-            "backend for the full on-device privacy guarantee.",
+            "🌐",
+            "REMOTE processing — email content is sent to the configured external "
+            "inference provider for this session. Use the Transformers backend to keep "
+            "email content on this device.",
         )
     else:
-        icon, note = (
+        icon, lock, note = (
             "⚪",
-            "No Gemma weights or token found, so a local keyword engine is standing in. "
-            "The JSON contract, tool calls and UI are identical — only the reasoning quality differs.",
+            "🔒",
+            "LOCAL processing — no Gemma weights were loaded, so an on-device keyword "
+            "engine is standing in. The JSON contract, tool calls and UI are identical; "
+            "only the reasoning quality differs.",
         )
 
+    # Remote inference is off by default and the banner has to be able to say so —
+    # a privacy claim nobody can check in the UI is not a privacy claim.
+    if llm.active_backend != "hf_api":
+        note += (
+            "  Remote inference is enabled for this session."
+            if llm.allow_remote
+            else "  Remote inference is disabled (ALLOW_REMOTE_INFERENCE is not 'true')."
+        )
+
+    accent = (
+        'style="background:rgba(217,119,6,.12);border-color:rgba(217,119,6,.4);"'
+        if llm.active_backend == "hf_api"
+        else ""
+    )
     return (
-        f'<div class="gt-bar">{icon} <b>Engine:</b> {esc(llm.backend_label)}'
-        f'<br><span style="opacity:.75;font-size:12.5px;">🔒 {esc(note)}</span></div>'
+        f'<div class="gt-bar" {accent}>{icon} <b>Engine:</b> {esc(llm.backend_label)}'
+        f'<br><span style="opacity:.75;font-size:12.5px;">{lock} {esc(note)}</span></div>'
     )
 
 
@@ -157,7 +187,10 @@ def engine_notes_md() -> str:
         f"- **Requested backend:** `{llm.requested_backend}`",
         f"- **Active backend:** `{llm.active_backend}`",
         f"- **Model id:** `{llm.model_id}`",
-        f"- **Inference location:** {'on this device' if llm.is_local else 'remote API'}",
+        "- **Processing location:** "
+        + ("on this device" if llm.is_local else "external inference provider"),
+        f"- **Remote inference permitted:** `{str(llm.allow_remote).lower()}` "
+        "(`ALLOW_REMOTE_INFERENCE`)",
     ]
     lines += [f"- {n}" for n in llm.notes] or ["- (no fallback events)"]
     return "\n".join(lines)
@@ -181,26 +214,75 @@ def load_sample_inbox() -> List[Dict[str, Any]]:
 def connect_gmail(count: int, query: str) -> Tuple[List[Dict[str, Any]], str]:
     """Run the Gmail OAuth flow and fetch recent mail. Never raises into Gradio."""
     try:
-        from gmail_integration import GmailError, fetch_recent, gmail_available
-    except Exception as exc:  # noqa: BLE001
-        return [], f"❌ Gmail connector unavailable: `{exc}`"
+        from gmail_integration import GOOGLE_LIBS_MISSING, GmailError, fetch_recent, gmail_available
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return [], "❌ The Gmail connector could not be loaded. See the server log for details."
 
     if not gmail_available():
-        return [], (
-            "❌ Google client libraries are not installed. Run:\n\n"
-            "```bash\npip install google-api-python-client google-auth-oauthlib google-auth-httplib2\n```"
-        )
+        return [], f"❌ {GOOGLE_LIBS_MISSING}"
 
     try:
         emails = fetch_recent(int(count), query=query or "in:inbox")
     except GmailError as exc:
+        # GmailError messages are written to be shown to a user.
         return [], f"❌ {exc}"
-    except Exception as exc:  # noqa: BLE001
-        return [], f"❌ Unexpected Gmail error: `{type(exc).__name__}: {exc}`"
+    except Exception:  # noqa: BLE001 - an arbitrary exception may carry paths or tokens
+        traceback.print_exc()
+        return [], "❌ Gmail could not be reached. See the server log for details."
 
     if not emails:
         return [], "⚠️ Gmail returned no messages for that query."
     return emails, f"✅ Fetched **{len(emails)}** message(s) from Gmail. Press **Run Triage**."
+
+
+def create_gmail_draft(emails: Any, index: int, reply_text: str) -> str:
+    """Create one Gmail draft, for one email, because a human pressed the button.
+
+    Called from a click handler and nowhere else. There is no path from triage to
+    here: classifying an inbox never touches Gmail, and this never sends anything.
+    """
+    if not isinstance(emails, list) or not 0 <= index < len(emails):
+        return "❌ This row is not part of the current run. Re-run triage and try again."
+
+    email = emails[index]
+    body = (reply_text or "").strip()
+    if not body:
+        return "❌ The reply is empty. Write something first — no draft was created."
+
+    try:
+        from gmail_integration import (
+            GOOGLE_LIBS_MISSING,
+            GmailError,
+            create_reply_draft,
+            gmail_available,
+        )
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return "❌ The Gmail connector could not be loaded. See the server log for details."
+
+    if not gmail_available():
+        return f"❌ {GOOGLE_LIBS_MISSING}"
+
+    try:
+        created = create_reply_draft(email, body)
+    except GmailError as exc:
+        # Covers a missing/malformed recipient, a missing OAuth client, and an API
+        # rejection. Every GmailError message is written to be shown to a user.
+        return f"❌ **{STATUS_FAILED}** — {exc}"
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return (
+            f"❌ **{STATUS_FAILED}** — the draft could not be created. "
+            "See the server log for details."
+        )
+
+    threaded = " It is threaded onto the original conversation." if created.get("threaded") else ""
+    return (
+        f"✅ **{STATUS_APPROVED} → {STATUS_CREATED}** — draft to `{created['to']}`, subject "
+        f"*{created['subject']}*.{threaded} It is sitting in your Gmail **Drafts** "
+        "folder and has **not** been sent."
+    )
 
 
 def load_demo(_: Any = None) -> Tuple[List[Dict[str, Any]], str]:
@@ -235,10 +317,13 @@ def overview_html(processed: List[ProcessedEmail], total: int, done: int) -> str
     return f'<div class="gt-stats">{cells}</div>'
 
 
-def _tool_card(accent: str, icon: str, title: str, detail: str) -> str:
+def _tool_card(accent: str, icon: str, title: str, detail: str, status: str = "") -> str:
+    chip = (
+        f'<span class="gt-status">{esc(status)}</span>' if status else ""
+    )
     return (
         f'<div class="gt-card" style="--gt-accent:{accent};">'
-        f'<div class="gt-card-title">{icon} {esc(title)}</div>'
+        f'<div class="gt-card-title">{icon} {esc(title)} {chip}</div>'
         f'<div class="gt-card-detail">{esc(detail)}</div></div>'
     )
 
@@ -281,15 +366,24 @@ def detail_html(item: ProcessedEmail) -> str:
     for flag in item.flags:
         actions.append(_tool_card("#dc2626", "🚩", flag.title, flag.detail))
     for task in item.tasks:
-        actions.append(_tool_card("#7c3aed", "✅", task.title, task.detail))
+        actions.append(
+            _tool_card("#7c3aed", "✅", task.title, task.detail, task.payload.get("status", ""))
+        )
     for event in item.events:
-        actions.append(_tool_card("#059669", "📅", event.title, event.detail))
+        actions.append(
+            _tool_card("#059669", "📅", event.title, event.detail, event.payload.get("status", ""))
+        )
 
+    parts.append('<div class="gt-section">Prepared actions</div>')
     if actions:
-        parts.append('<div class="gt-section">Executed tool calls</div>')
         parts.extend(actions)
+        parts.append(
+            '<div style="font-size:12px;opacity:.6;margin-top:6px;">'
+            f"{esc(STATUS_PREPARED)} means the Google Tasks / Calendar request has been "
+            "built and validated here. Nothing has been sent to Google — that would "
+            f"show as “{esc(STATUS_CREATED)}”.</div>"
+        )
     else:
-        parts.append('<div class="gt-section">Executed tool calls</div>')
         parts.append(
             '<div style="font-size:13px;opacity:.6;">No follow-up actions — '
             "the agent decided this email needs nothing.</div>"
@@ -315,6 +409,8 @@ def blank_row() -> List[Any]:
         gr.update(label="Details"),
         gr.update(value=""),
         gr.update(value="", visible=False),
+        gr.update(visible=False),
+        gr.update(value="", visible=False),
     ]
 
 
@@ -324,13 +420,14 @@ def render_row(item: ProcessedEmail, position: int) -> List[Any]:
     label = f"▸ {subject} — reasoning, reply & {n_actions} action(s)"
 
     reply = item.reply_text
+    has_reply = bool(reply)
     reply_update = (
         gr.update(
             value=reply,
             visible=True,
             label=f"✍️ Suggested reply (editable) — to {item.email.get('from', '')[:60]}",
         )
-        if reply
+        if has_reply
         else gr.update(value="", visible=False)
     )
 
@@ -340,13 +437,21 @@ def render_row(item: ProcessedEmail, position: int) -> List[Any]:
         gr.update(label=label),
         gr.update(value=detail_html(item)),
         reply_update,
+        # The draft button only exists where there is a reply to draft.
+        gr.update(visible=has_reply),
+        gr.update(value="", visible=False),
     ]
 
 
 def build_outputs(
     processed: List[ProcessedEmail], total: int, status: str
 ) -> List[Any]:
-    """Assemble the full flat output tuple Gradio expects."""
+    """Assemble the full flat output tuple Gradio expects.
+
+    The second element is the displayed-order email list, kept in a ``gr.State`` so a
+    per-row draft button can resolve its row back to the right email even after the
+    inbox has been re-sorted mid-run.
+    """
     done = len(processed)
     rows: List[Any] = []
     for i in range(MAX_ROWS):
@@ -355,7 +460,8 @@ def build_outputs(
     trace = json.dumps(
         [p.to_dict(include_raw=True) for p in processed], indent=2, ensure_ascii=False
     )
-    return [status, overview_html(processed, total, done), trace, *rows]
+    order = [p.email for p in processed]
+    return [status, order, overview_html(processed, total, done), trace, *rows]
 
 
 # =====================================================================
@@ -402,8 +508,9 @@ def run_triage(emails: Optional[List[Dict[str, Any]]]):
         total,
         f"✅ Done — **{stats['total']}** emails triaged on `{backend}`: "
         f"{stats['URGENT']} urgent, {stats['ACTION_NEEDED']} needing action, "
-        f"{stats['replies']} replies drafted, {stats['tasks']} tasks and "
-        f"{stats['events']} calendar events extracted.",
+        f"{stats['replies']} replies drafted, and {stats['tasks']} task / "
+        f"{stats['events']} calendar payloads prepared for review. "
+        "Nothing has been sent, filed or scheduled.",
     )
 
 
@@ -444,14 +551,18 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(**blocks_kwargs) as demo:
         gr.Markdown(
             "# 📥 Gemma-Triage\n"
-            "### Smart email agent & workflow automator — running on Gemma 4, on your device\n"
+            "### Smart email agent & workflow automator, powered by Gemma 4\n"
             "Every email is classified, prioritised, summarised, answered with a draft reply, "
-            "and mined for tasks and calendar events — by a single local model that calls its own tools."
+            "and mined for tasks and calendar events — by a single model that calls its own tools. "
+            "With the Transformers backend that model runs on this device and email content "
+            "stays here; the status bar below always names the engine actually in use."
         )
 
         status_bar = gr.HTML(status_bar_html())
 
         inbox_state = gr.State(initial_emails)
+        #: Emails in the order they are displayed, so a row's draft button can find its own.
+        display_state = gr.State([])
 
         with gr.Row():
             mode = gr.Radio(
@@ -466,7 +577,8 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "**Gmail (optional).** Opens a Google consent screen in your browser and "
                 "requests read-only + draft-compose access. Requires a local "
-                "`credentials.json`. Drafts are never sent automatically. "
+                "`credentials.json`. No send scope is ever requested, and a draft is only "
+                "ever created when you press **📧 Create Gmail Draft** on a specific reply. "
                 "Not available on the hosted Space — run locally for this path."
             )
             with gr.Row():
@@ -483,6 +595,7 @@ def build_ui() -> gr.Blocks:
 
         # --- pre-allocated result rows ---------------------------------
         row_components: List[Any] = []
+        draft_bindings: List[Tuple[int, Any, Any, Any]] = []
         for i in range(MAX_ROWS):
             with gr.Group(visible=False) as group:
                 head = gr.HTML()
@@ -493,17 +606,30 @@ def build_ui() -> gr.Blocks:
                         lines=9,
                         visible=False,
                         interactive=True,
-                        info="Edit freely, then copy into your mail client. Nothing is sent automatically.",
+                        info=(
+                            "Edit freely. Nothing is sent automatically — the button below "
+                            "creates a Gmail *draft* from exactly this text."
+                        ),
                     )
-            row_components.extend([group, head, accordion, detail, reply])
+                    draft_btn = gr.Button(
+                        "📧 Create Gmail Draft", size="sm", visible=False, variant="secondary"
+                    )
+                    draft_status = gr.Markdown(visible=False)
+            row_components.extend([group, head, accordion, detail, reply, draft_btn, draft_status])
+            draft_bindings.append((i, draft_btn, reply, draft_status))
 
         with gr.Accordion("🧠 Raw agent trace (the JSON Gemma actually produced)", open=False):
-            trace = gr.Code(language="json", label="Structured output + executed tool calls")
+            trace = gr.Code(
+                language="json", label="Structured output + the tool calls it produced"
+            )
 
         with gr.Accordion("⚙️ Engine settings & backend transparency", open=False):
             gr.Markdown(
-                "`GEMMA_BACKEND=auto` tries **transformers** (on-device) → **hf_api** → "
-                "**heuristic**. Change it here to force a tier, then rebuild."
+                "`GEMMA_BACKEND=auto` tries **transformers** (on-device) → **heuristic** "
+                "(on-device). It only considers **hf_api** — which sends email content to "
+                "an external inference provider — when `ALLOW_REMOTE_INFERENCE=true`. "
+                "Selecting `hf_api` here is an explicit request for remote processing and "
+                "is always honoured. Change the tier, then rebuild."
             )
             with gr.Row():
                 backend_choice = gr.Dropdown(
@@ -523,15 +649,29 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "<div style='opacity:.55;font-size:12px;margin-top:18px;'>"
             "Gemma-Triage · Apache-2.0 code · Gemma model weights are governed by the "
-            "<a href='https://ai.google.dev/gemma/terms'>Gemma Terms of Use</a>. "
-            "Drafts and extracted actions are suggestions for a human to review — nothing is sent automatically."
+            "<a href='https://ai.google.dev/gemma/terms'>Gemma Terms of Use</a>.<br>"
+            "Action lifecycle: <b>Suggested action → Prepared payload → Approved → "
+            "Created (external)</b>. Tasks and calendar entries stop at "
+            "<b>Prepared payload</b>; a Gmail draft reaches <b>Created (external)</b> only "
+            "after you press the button, and is never sent."
             "</div>"
         )
 
         # --- wiring ----------------------------------------------------
-        triage_outputs = [status, overview, trace, *row_components]
+        triage_outputs = [status, display_state, overview, trace, *row_components]
 
         run_btn.click(fn=run_triage, inputs=[inbox_state], outputs=triage_outputs)
+
+        # One click handler per row. Each closes over its own row index and reads the
+        # *edited* textbox, so the draft is whatever the user actually approved.
+        for index, button, reply_box, reply_status in draft_bindings:
+            button.click(
+                fn=(lambda i: lambda emails, text: gr.update(
+                    value=create_gmail_draft(emails, i, text), visible=True
+                ))(index),
+                inputs=[display_state, reply_box],
+                outputs=[reply_status],
+            )
 
         mode.change(
             fn=lambda choice: gr.update(visible=choice == "Connect Gmail"),

@@ -10,6 +10,7 @@ raising -- the UI must not crash on a malformed generation.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -28,6 +29,36 @@ CATEGORY_RANK: Dict[str, int] = {name: i for i, name in enumerate(CATEGORIES)}
 KNOWN_TOOLS: frozenset[str] = frozenset(
     {"draft_reply", "create_task", "create_calendar_event", "flag_urgent"}
 )
+
+#: Argument names each tool accepts. Everything else in an ``args`` object is
+#: discarded. Email content is untrusted: a message that talks the model into adding
+#: a ``notes`` or ``attachment`` field must not get that field through to a payload.
+TOOL_ARG_NAMES: Dict[str, frozenset[str]] = {
+    "draft_reply": frozenset({"tone"}),
+    "create_task": frozenset({"title", "due"}),
+    "create_calendar_event": frozenset({"title", "date", "time"}),
+    "flag_urgent": frozenset({"reason"}),
+}
+
+#: Fallback ceiling on tool calls per email when MAX_ACTIONS_PER_EMAIL is unset.
+DEFAULT_MAX_ACTIONS_PER_EMAIL = 5
+
+#: Longest accepted tool-argument string. Downstream tools truncate further; this
+#: stops an injected wall of text reaching them in the first place.
+MAX_ARG_CHARS = 500
+
+
+def max_actions_per_email() -> int:
+    """Ceiling on tool calls accepted from one email.
+
+    Read per call, not at import, so the limit can be changed without a restart.
+    "Create ten calendar events" is a normal-looking instruction to smuggle into an
+    email body; this is the backstop that makes it not matter.
+    """
+    try:
+        return max(0, int(str(os.getenv("MAX_ACTIONS_PER_EMAIL", "")).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ACTIONS_PER_EMAIL
 
 #: Common near-misses mapped back onto the canonical vocabulary.
 _CATEGORY_ALIASES: Dict[str, str] = {
@@ -233,13 +264,38 @@ def _coerce_optional_text(value: Any, limit: int = 4000) -> Optional[str]:
     return text
 
 
+def _coerce_arg_value(value: Any) -> Any:
+    """Keep scalars, drop structure.
+
+    Every documented tool argument is a string, a number or null. A nested object or
+    array in an ``args`` payload is either a confused generation or an attempt to
+    smuggle extra fields past the per-tool name allow-list; neither is worth keeping.
+    """
+    if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:MAX_ARG_CHARS]
+    return None
+
+
 def _coerce_actions(value: Any) -> List[ToolCall]:
-    """Normalise the ``actions`` array, dropping anything unusable."""
+    """Normalise the ``actions`` array, dropping anything unusable or unsanctioned.
+
+    Three independent gates, all of which treat the generation as untrusted: the tool
+    must be on the allow-list, each argument name must be one the tool declares, and
+    the whole list is capped by :func:`max_actions_per_email`.
+    """
     if not isinstance(value, list):
         return []
 
+    limit = max_actions_per_email()
+    if limit <= 0:
+        return []
+
     calls: List[ToolCall] = []
-    for item in value[:8]:  # a hard cap keeps a runaway generation from ballooning the UI
+    seen: set[str] = set()
+
+    for item in value:
         if isinstance(item, str):
             item = {"tool": item, "args": {}}
         if not isinstance(item, dict):
@@ -258,20 +314,27 @@ def _coerce_actions(value: Any) -> List[ToolCall]:
             args = extract_json(args) or {}
         if not isinstance(args, dict):
             args = {}
-        # Keys must be strings for downstream ** expansion and JSON round-tripping.
-        args = {str(k): v for k, v in args.items()}
 
-        calls.append(ToolCall(tool=canonical, args=args))
+        # Keys must be strings for downstream ** expansion and JSON round-tripping,
+        # and must be arguments this tool actually declares.
+        allowed = TOOL_ARG_NAMES.get(canonical, frozenset())
+        args = {
+            str(k): _coerce_arg_value(v) for k, v in args.items() if str(k) in allowed
+        }
 
-    # De-duplicate identical calls while preserving order.
-    seen: set[str] = set()
-    deduped: List[ToolCall] = []
-    for call in calls:
+        # De-duplicate as we go so padding the list with repeats cannot crowd out the
+        # distinct actions that follow, and so the cap bounds the work, not just the
+        # output.
+        call = ToolCall(tool=canonical, args=args)
         key = json.dumps(call.to_dict(), sort_keys=True, default=str)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(call)
-    return deduped
+        if key in seen:
+            continue
+        seen.add(key)
+        calls.append(call)
+        if len(calls) >= limit:
+            break
+
+    return calls
 
 
 def parse_triage(text: str) -> TriageDecision:

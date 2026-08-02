@@ -21,6 +21,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from gmail_integration.client import extract_address, normalize_reply_subject
+
 from .schema import TriageDecision
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -32,6 +34,36 @@ CALENDAR_TIMEZONE = os.environ.get("GOOGLE_CALENDAR_TIMEZONE", "UTC")
 DEFAULT_EVENT_MINUTES = 30
 
 VALID_TONES = ("professional", "friendly", "urgent", "brief", "firm")
+
+# ---------------------------------------------------------------------------
+# Action status vocabulary
+# ---------------------------------------------------------------------------
+#
+# The lifecycle of every action this agent produces, in order. Used verbatim in UI
+# status strings so a viewer is never left guessing whether something actually
+# happened somewhere outside this app:
+#
+#   Suggested action  -> the model asked for it
+#   Prepared payload  -> validated and shaped for the external API, not sent anywhere
+#   Approved          -> a human clicked
+#   Created (external)-> an external API call returned success. Only ever set after one.
+#   Failed            -> it was attempted and did not succeed
+#
+# Nothing in this module can reach "Created (external)": it only prepares payloads.
+
+STATUS_SUGGESTED = "Suggested action"
+STATUS_PREPARED = "Prepared payload"
+STATUS_APPROVED = "Approved"
+STATUS_CREATED = "Created (external)"
+STATUS_FAILED = "Failed"
+
+ACTION_STATUSES = (
+    STATUS_SUGGESTED,
+    STATUS_PREPARED,
+    STATUS_APPROVED,
+    STATUS_CREATED,
+    STATUS_FAILED,
+)
 
 #: Declarative catalogue, kept in sync with prompts/triage_prompt.txt. Used for
 #: argument validation here and rendered in the README.
@@ -248,6 +280,12 @@ def draft_reply(
     if tone not in VALID_TONES:
         tone = "professional"
 
+    # No recipient, no draft. Checked before spending a generation on a reply that
+    # could never be addressed to anyone.
+    recipient = extract_address(email.get("from"))
+    if not recipient:
+        raise ValueError("the sender address is missing or malformed, so no reply was drafted")
+
     system = render(load_prompt("reply_prompt.txt"), tone=tone)
     user = build_email_block(email, extra={"TRIAGE SUMMARY": (decision.summary if decision else "")})
 
@@ -257,7 +295,6 @@ def draft_reply(
     if not body:
         raise ValueError("the model returned an empty reply body")
 
-    subject = str(email.get("subject") or "").strip()
     return ToolResult(
         tool="draft_reply",
         ok=True,
@@ -266,9 +303,12 @@ def draft_reply(
         detail=body,
         payload={
             "to": email.get("from", ""),
-            "subject": subject if subject.lower().startswith("re:") else f"Re: {subject}",
+            "recipient": recipient,
+            "subject": normalize_reply_subject(email.get("subject")),
             "body": body,
             "tone": tone,
+            # A drafted reply is a suggestion until a human presses the button.
+            "status": STATUS_SUGGESTED,
         },
     )
 
@@ -311,6 +351,8 @@ def create_task(email: Dict[str, Any], args: Dict[str, Any], today: Optional[dat
             "source_email": email.get("id", ""),
             "api_payload": api_payload,
             "api_target": "Google Tasks — tasks.tasks.insert",
+            # Shaped for the API. Nothing has been sent to Google.
+            "status": STATUS_PREPARED,
         },
     )
 
@@ -366,6 +408,8 @@ def create_calendar_event(
             "source_email": email.get("id", ""),
             "api_payload": api_payload,
             "api_target": "Google Calendar — events.insert",
+            # Shaped for the API. Nothing has been sent to Google.
+            "status": STATUS_PREPARED,
         },
     )
 
@@ -445,6 +489,7 @@ def execute_actions(
                     kind=str(spec.get("kind", "unknown")),
                     title=f"{call.tool} failed",
                     error=f"{type(exc).__name__}: {exc}",
+                    payload={"status": STATUS_FAILED},
                 )
             )
 
