@@ -1,0 +1,56 @@
+# --- Secrets and credentials — NEVER commit these -------------------------
+.env
+.env.*
+!.env.example
+credentials.json
+client_secret*.json
+token.json
+token.pickle
+*.pem
+*.key
+service-account*.json
+
+# --- Fetched mail / local agent output ------------------------------------
+data/gmail_cache/
+data/local_inbox.json
+outputs/
+*.local.json
+
+# --- Model weights and caches ---------------------------------------------
+models/
+weights/
+*.gguf
+*.safetensors
+.cache/
+hf_cache/
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+
+# --- Tooling --------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors and OS -------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Gradio ---------------------------------------------------------------
+.gradio/
+flagged/
+gradio_cached_examples/

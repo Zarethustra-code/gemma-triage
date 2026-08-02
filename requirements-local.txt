@@ -1,0 +1,23 @@
+# Gemma-Triage — on-device inference stack (GEMMA_BACKEND=transformers).
+#
+# Install this on top of requirements.txt to run Gemma 4 locally, so that no email
+# content ever leaves the machine:
+#
+#     pip install -r requirements-local.txt
+#
+# Roughly 3 GB of wheels plus the model weights (~4.5 GB for E4B in bf16), which is
+# why it is kept separate from the lean default install.
+
+-r requirements.txt
+
+torch>=2.4.0
+accelerate>=0.34.0
+
+# Gemma 4 needs a transformers build that ships its model classes. If your installed
+# release predates Gemma 4 support, install from source instead:
+#     pip install git+https://github.com/huggingface/transformers
+transformers>=4.57.0
+
+# Faster tokenisation and image preprocessing for the multimodal path.
+sentencepiece>=0.2.0
+pillow>=10.0.0

@@ -1,0 +1,22 @@
+# Gemma-Triage — runtime dependencies.
+#
+# This file is deliberately lean so `pip install -r requirements.txt && python app.py`
+# is fast and works everywhere, including a free CPU Hugging Face Space. It covers the
+# UI, the hosted-Gemma backend, and the Gmail connector.
+#
+# For TRUE on-device inference (Gemma 4 running locally via transformers), also install:
+#     pip install -r requirements-local.txt
+
+# --- UI -------------------------------------------------------------------
+gradio>=5.0,<7.0
+
+# --- Gemma 4 via the Hugging Face Inference API (GEMMA_BACKEND=hf_api) -----
+huggingface_hub>=0.24.0
+
+# --- Gmail connector (optional path; import is lazy) ----------------------
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+
+# --- Tests ----------------------------------------------------------------
+pytest>=7.4.0

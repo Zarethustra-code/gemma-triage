@@ -1,0 +1,101 @@
+{
+  "description": "Synthetic demo inbox for Gemma-Triage. All senders, domains, and content are fictional. Covers every category (URGENT, ACTION_NEEDED, FYI, SPAM) and every tool (draft_reply, create_task, create_calendar_event, flag_urgent).",
+  "emails": [
+    {
+      "id": "msg-001",
+      "from": "Priya Raman <priya.raman@northwind-labs.example>",
+      "to": "me@example.com",
+      "subject": "URGENT: checkout API returning 503 for ~40% of traffic",
+      "date": "Mon, 3 Aug 2026 08:12:00 +0000",
+      "body": "We started seeing elevated 503s on the checkout API about 25 minutes ago. Roughly 40% of payment attempts are failing and the error rate is still climbing. I've paged the on-call engineer but we need a decision on whether to roll back release 4.12 immediately or keep debugging forward.\n\nRevenue impact is already material. Can you confirm the rollback call in the next 30 minutes? I'm holding the incident bridge open.\n\nPriya"
+    },
+    {
+      "id": "msg-002",
+      "from": "Security Operations <secops@northwind-labs.example>",
+      "to": "me@example.com",
+      "subject": "Action required today: rotate the leaked staging credentials",
+      "date": "Mon, 3 Aug 2026 07:40:00 +0000",
+      "body": "During a routine scan we found a staging database credential committed to a public repository fork. The key has been revoked, but every service that referenced it must be rotated and redeployed before end of day today.\n\nYour team owns two of the affected services (billing-worker and report-exporter). Please confirm once both have been rotated. This is time-sensitive: we cannot close the incident ticket until all owners have signed off.\n\nSecurity Operations"
+    },
+    {
+      "id": "msg-003",
+      "from": "Daniel Okafor <daniel.okafor@brightpath-partners.example>",
+      "to": "me@example.com",
+      "subject": "Contract review - signed copy needed by Friday",
+      "date": "Sun, 2 Aug 2026 16:05:00 +0000",
+      "body": "Hi,\n\nThanks for the call last week. I've attached the revised partnership agreement with the two changes we discussed: the payment window moves to net-30 and the exclusivity clause has been removed entirely.\n\nCould you review it and send the signed copy back by Friday? Our legal team needs it before they can start the onboarding paperwork.\n\nLet me know if anything still looks off.\n\nBest,\nDaniel"
+    },
+    {
+      "id": "msg-004",
+      "from": "Mariam Haddad <mariam.haddad@northwind-labs.example>",
+      "to": "me@example.com",
+      "subject": "Can we move the roadmap sync to Thursday at 2pm?",
+      "date": "Sun, 2 Aug 2026 11:20:00 +0000",
+      "body": "Quick scheduling question. Half the design team is out on Wednesday, so the roadmap sync would be pretty thin. Could we move it to Thursday at 2pm instead? Same room, same agenda.\n\nIf that works I'll resend the invite. If Thursday is bad for you, Friday morning is my other option.\n\nThanks,\nMariam"
+    },
+    {
+      "id": "msg-005",
+      "from": "Tomas Vercelli <t.vercelli@quaystone-recruiting.example>",
+      "to": "me@example.com",
+      "subject": "Interview slot confirmation - 2026-08-11, 10:30",
+      "date": "Sun, 2 Aug 2026 09:15:00 +0000",
+      "body": "Good news - the client would like to move forward with a technical interview.\n\nThe proposed slot is 2026-08-11 at 10:30. It runs for about an hour and will be a systems design discussion, no live coding.\n\nPlease confirm the slot works and I'll send the video link. If it doesn't, send me two alternative windows that week and I'll try to match them.\n\nTomas"
+    },
+    {
+      "id": "msg-006",
+      "from": "Aisha Bello <aisha.bello@northwind-labs.example>",
+      "to": "me@example.com",
+      "subject": "Feedback on the Q3 hiring plan draft?",
+      "date": "Sat, 1 Aug 2026 14:48:00 +0000",
+      "body": "I've put together a first draft of the Q3 hiring plan - three backend roles, one designer, and a contractor budget for the data migration.\n\nCould you take a look and give me your feedback before I circulate it more widely? No rush, but it would be great to have your comments sometime next week so I can finalise numbers before the budget meeting.\n\nAisha"
+    },
+    {
+      "id": "msg-007",
+      "from": "Northwind Engineering Digest <noreply@northwind-labs.example>",
+      "to": "me@example.com",
+      "subject": "Weekly engineering digest - week 31",
+      "date": "Sat, 1 Aug 2026 06:00:00 +0000",
+      "body": "This week across engineering:\n\n- Release 4.12 shipped to production on Wednesday.\n- The search reindexing job is now 3x faster after the sharding change.\n- Two new starters joined the platform team.\n- Reminder: the internal docs site moved to a new domain; old links redirect until October.\n\nNo action is needed. You are receiving this because you are subscribed to the engineering digest."
+    },
+    {
+      "id": "msg-008",
+      "from": "CloudHost Billing <billing-noreply@cloudhost-services.example>",
+      "to": "me@example.com",
+      "subject": "Your July invoice is available",
+      "date": "Sat, 1 Aug 2026 02:31:00 +0000",
+      "body": "Your invoice for July 2026 is now available in the billing portal.\n\nAmount: 412.60\nStatus: paid automatically via the card ending 4417.\nNext billing date: 1 September 2026.\n\nThis is an automated notification, please do not reply to this message."
+    },
+    {
+      "id": "msg-009",
+      "from": "Rewards Center <winner-alerts@prize-notify-global.example>",
+      "to": "me@example.com",
+      "subject": "CONGRATULATIONS!! You have won a $5,000 gift card - claim now!",
+      "date": "Fri, 31 Jul 2026 22:07:00 +0000",
+      "body": "Dear customer,\n\nCONGRATULATIONS! You have been selected as our weekly winner. A $5,000 gift card is waiting for you, but this is a limited time offer and you must claim your prize within 24 hours.\n\nClick here to verify your account and act now - 100% free, no obligation!\n\nUnsubscribe at any time."
+    },
+    {
+      "id": "msg-010",
+      "from": "Account Security <support@secure-verify-portal.example>",
+      "to": "me@example.com",
+      "subject": "Your account has been suspended - immediate verification required",
+      "date": "Fri, 31 Jul 2026 19:44:00 +0000",
+      "body": "Dear user,\n\nWe have detected unusual activity and your account has been suspended. To restore access you must verify your account immediately.\n\nClick here to confirm your password and payment details. Failure to act now will result in permanent closure within 24 hours.\n\nThis is your final notice."
+    },
+    {
+      "id": "msg-011",
+      "from": "Lucas Meyer <lucas.meyer@harborline-supply.example>",
+      "to": "me@example.com",
+      "subject": "Shipment delayed - need a decision on the substitute part",
+      "date": "Sun, 2 Aug 2026 13:02:00 +0000",
+      "body": "Hi,\n\nThe bearings you ordered are stuck at customs and the earliest realistic delivery is now the 19th. That's two weeks past your install date.\n\nWe have a substitute part in stock that matches the spec except the seal material, which is nitrile rather than viton. It would ship tomorrow.\n\nCould you let me know by Tuesday whether you want the substitute or prefer to wait? I can hold the stock until then but not longer.\n\nLucas"
+    },
+    {
+      "id": "msg-012",
+      "from": "Facilities <facilities@northwind-labs.example>",
+      "to": "all-staff@northwind-labs.example",
+      "subject": "Office wifi maintenance window this Saturday",
+      "date": "Fri, 31 Jul 2026 15:30:00 +0000",
+      "body": "The office wifi will be unavailable this Saturday between 07:00 and 11:00 while we replace the access points on floors two and three.\n\nWired connections in the lab are unaffected. If you plan to work from the office on Saturday, please plan around the window.\n\nFor your information only - no reply needed."
+    }
+  ]
+}
