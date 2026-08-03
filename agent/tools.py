@@ -269,6 +269,58 @@ def normalize_time(value: Any) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def normalize_tone(tone: Any) -> str:
+    """Coerce any tone request to a member of :data:`VALID_TONES`.
+
+    The tone can arrive from the model's own tool arguments or from a dropdown in the
+    UI. Neither is trusted: anything outside the vocabulary becomes ``professional``.
+    """
+    candidate = str(tone or "professional").strip().lower()
+    return candidate if candidate in VALID_TONES else "professional"
+
+
+def _decision_summary(decision: Any) -> str:
+    """Read the triage summary off whatever the caller had to hand.
+
+    ``draft_reply`` holds a :class:`TriageDecision`; the UI's regenerate button only
+    keeps the summary string in its row state. Both reach the same prompt.
+    """
+    if decision is None:
+        return ""
+    if isinstance(decision, str):
+        return decision
+    if isinstance(decision, dict):
+        return str(decision.get("summary") or "")
+    return str(getattr(decision, "summary", "") or "")
+
+
+def regenerate_reply(
+    llm: Any,
+    email: Dict[str, Any],
+    tone: str = "professional",
+    decision: Optional[TriageDecision] = None,
+) -> str:
+    """Run ONLY the reply-writing Gemma call and return the reply body text.
+
+    This is the second Gemma call of the agent loop on its own: no classification, no
+    tool dispatch, no external side effect. ``draft_reply`` uses it to produce the
+    initial draft, and the UI's per-row regenerate button uses it to rewrite that draft
+    in a different tone without re-triaging anything.
+
+    Falls back to ``professional`` for an unknown tone. Never sends anything.
+    """
+    tone = normalize_tone(tone)
+
+    system = render(load_prompt("reply_prompt.txt"), tone=tone)
+    user = build_email_block(email, extra={"TRIAGE SUMMARY": _decision_summary(decision)})
+
+    body = _strip_reply_artifacts((llm.generate(system, user) or "").strip())
+
+    if not body:
+        raise ValueError("the model returned an empty reply body")
+    return body
+
+
 def draft_reply(
     llm: Any,
     email: Dict[str, Any],
@@ -276,9 +328,7 @@ def draft_reply(
     decision: Optional[TriageDecision] = None,
 ) -> ToolResult:
     """Second Gemma call: write the reply body in the tone the model chose."""
-    tone = str(args.get("tone") or "professional").strip().lower()
-    if tone not in VALID_TONES:
-        tone = "professional"
+    tone = normalize_tone(args.get("tone"))
 
     # No recipient, no draft. Checked before spending a generation on a reply that
     # could never be addressed to anyone.
@@ -286,14 +336,7 @@ def draft_reply(
     if not recipient:
         raise ValueError("the sender address is missing or malformed, so no reply was drafted")
 
-    system = render(load_prompt("reply_prompt.txt"), tone=tone)
-    user = build_email_block(email, extra={"TRIAGE SUMMARY": (decision.summary if decision else "")})
-
-    body = (llm.generate(system, user) or "").strip()
-    body = _strip_reply_artifacts(body)
-
-    if not body:
-        raise ValueError("the model returned an empty reply body")
+    body = regenerate_reply(llm, email, tone, decision)
 
     return ToolResult(
         tool="draft_reply",
