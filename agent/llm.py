@@ -1,19 +1,24 @@
 """Gemma 4 backend abstraction.
 
-One class, :class:`GemmaLLM`, with one method, :meth:`GemmaLLM.generate`. Three
+One class, :class:`GemmaLLM`, with one method, :meth:`GemmaLLM.generate`. Four
 interchangeable backends sit behind it, selected by the ``GEMMA_BACKEND`` env var:
 
     1. ``transformers``  -- Gemma 4 running locally, on-device. Email content stays
                             on this machine. The real product.
-    2. ``hf_api``        -- Gemma 4 hosted via the Hugging Face Inference API. Email
+    2. ``ollama``        -- Gemma 4 running locally through an Ollama server on this
+                            machine. Same privacy posture as ``transformers``, but no
+                            torch and no weights download; the standard library talks
+                            to its OpenAI-compatible endpoint.
+    3. ``hf_api``        -- Gemma 4 hosted via the Hugging Face Inference API. Email
                             content is sent to an external provider.
-    3. ``heuristic``     -- a dependency-free keyword engine honouring the same
+    4. ``heuristic``     -- a dependency-free keyword engine honouring the same
                             JSON contract, so the demo can never hard-fail. Local.
 
-``auto`` (the default) tries ``transformers`` and then ``heuristic``. It reaches the
-hosted tier **only** when ``ALLOW_REMOTE_INFERENCE=true``; otherwise nothing ever
-leaves the device without the operator having asked for it in so many words. Naming
-``hf_api`` explicitly is itself that request, and is always honoured.
+``auto`` (the default) tries ``transformers``, then ``ollama``, then ``heuristic``. It
+reaches the hosted tier **only** when ``ALLOW_REMOTE_INFERENCE=true``; otherwise nothing
+ever leaves the device without the operator having asked for it in so many words. Naming
+``hf_api`` explicitly is itself that request, and is always honoured. Ollama carries no
+such gate, because reaching localhost is not leaving the device.
 
 The heuristic tier is deliberately not a mock: it returns schema-valid output for
 both prompt types, which means the UI, the tool executor and the test suite all
@@ -24,13 +29,29 @@ produced what they are looking at, and whether it ran here or elsewhere.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 # Default checkpoint. E4B is the effective-4B on-device variant; E2B is the lighter
 # sibling for constrained hardware. Override with GEMMA_MODEL_ID.
 DEFAULT_MODEL_ID = os.environ.get("GEMMA_MODEL_ID", "google/gemma-4-E4B-it")
+
+#: Ollama's OpenAI-compatible endpoint. It is a server on this machine, so email content
+#: reaches nothing but localhost — the same privacy posture as `transformers`, without
+#: torch and without a weights download.
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:12b")
+
+#: Health-check budget. A server that is not there refuses instantly; this only caps
+#: the pathological case, so a missing Ollama never stalls app start-up.
+OLLAMA_PROBE_TIMEOUT_S = 3
+
+#: Generation budget. The first call has to load the model into memory, which on a cold
+#: 12B can take minutes; the ceiling is deliberately generous.
+OLLAMA_TIMEOUT_S = 300
 
 #: Model classes probed in order when loading locally. Older `transformers` builds
 #: lack the newer names, so we walk down until one both exists and loads.
@@ -40,7 +61,11 @@ _MODEL_CLASS_CANDIDATES = (
     "AutoModelForCausalLM",
 )
 
-VALID_BACKENDS = ("auto", "transformers", "hf_api", "heuristic")
+VALID_BACKENDS = ("auto", "transformers", "ollama", "hf_api", "heuristic")
+
+#: Backends that run inference on this device. Ollama is one of them: it is a local
+#: server, so it is never gated behind ALLOW_REMOTE_INFERENCE.
+LOCAL_BACKENDS = ("transformers", "ollama", "heuristic")
 
 #: After this many consecutive generation failures, drop to the heuristic tier
 #: permanently rather than paying for a failing round trip on every email.
@@ -91,6 +116,8 @@ class GemmaLLM:
         self._model: Any = None
         self._processor: Any = None
         self._client: Any = None
+        self._ollama_url: str = ""
+        self._ollama_model: str = ""
         self._degraded: bool = False
         self._consecutive_failures: int = 0
 
@@ -114,7 +141,7 @@ class GemmaLLM:
     @property
     def is_local(self) -> bool:
         """True when inference runs on this device, so email content stays here."""
-        return self._active_backend in ("transformers", "heuristic")
+        return self._active_backend in LOCAL_BACKENDS
 
     @property
     def is_remote(self) -> bool:
@@ -126,6 +153,7 @@ class GemmaLLM:
         """Short description for the UI status bar."""
         labels = {
             "transformers": f"Gemma 4 on-device ({self.model_id}, transformers)",
+            "ollama": f"Gemma 4 on-device via Ollama ({self._ollama_model})",
             "hf_api": f"REMOTE — Gemma 4 via the Hugging Face Inference API ({self.model_id})",
             "heuristic": "Heuristic fallback engine, on-device (no Gemma weights loaded)",
         }
@@ -138,23 +166,37 @@ class GemmaLLM:
         """Pick a backend, honouring an explicit request and falling back sanely.
 
         Hosted inference is never chosen implicitly. ``auto`` walks
-        ``transformers -> heuristic`` unless ``ALLOW_REMOTE_INFERENCE=true``, in which
-        case ``hf_api`` is inserted between them. Asking for ``hf_api`` by name is an
-        explicit, informed choice and is always honoured.
+        ``transformers -> ollama -> heuristic`` unless ``ALLOW_REMOTE_INFERENCE=true``,
+        in which case ``hf_api`` is inserted before the heuristic tier. Ollama needs no
+        such gate: it is a server on this machine, so reaching it changes nothing about
+        where email content goes. Asking for ``hf_api`` by name is an explicit, informed
+        choice and is always honoured.
         """
         if requested == "heuristic":
             self.notes.append("Heuristic backend requested explicitly.")
             return "heuristic"
 
-        if requested in ("transformers", "hf_api"):
+        initialisers = {
+            "transformers": self._try_init_transformers,
+            "ollama": self._try_init_ollama,
+            "hf_api": self._try_init_hf_api,
+        }
+
+        if requested in initialisers:
             order = [requested]
             if requested == "hf_api":
                 self.notes.append(
                     "Hosted backend requested explicitly — email content will be sent to "
                     "the configured external inference provider."
                 )
+            elif requested == "ollama":
+                self.notes.append(
+                    "Ollama backend requested explicitly — inference runs on a local "
+                    "server, so email content stays on this device."
+                )
         else:
-            order = ["transformers"]
+            # On-device tiers first, always. Hosted only ever joins the ladder by consent.
+            order = ["transformers", "ollama"]
             if self.allow_remote:
                 order.append("hf_api")
                 self.notes.append(
@@ -163,12 +205,12 @@ class GemmaLLM:
             else:
                 self.notes.append(
                     "Remote inference is disabled (ALLOW_REMOTE_INFERENCE is not 'true'), "
-                    "so `auto` resolves on-device only: transformers, then heuristic."
+                    "so `auto` resolves on-device only: transformers, then Ollama, then "
+                    "heuristic."
                 )
 
         for name in order:
-            ok = self._try_init_transformers() if name == "transformers" else self._try_init_hf_api()
-            if ok:
+            if initialisers[name]():
                 return name
 
         self.notes.append("Falling back to the heuristic engine; output stays schema-valid.")
@@ -235,6 +277,41 @@ class GemmaLLM:
                     break
         return False
 
+    @staticmethod
+    def _ollama_tags_url() -> str:
+        """Native health endpoint that sits beside the OpenAI-compatible ``/v1`` surface."""
+        root = OLLAMA_BASE_URL.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[: -len("/v1")]
+        return f"{root}/api/tags"
+
+    def _try_init_ollama(self) -> bool:
+        """Check that a local Ollama server is answering. Returns False (with a note).
+
+        Only a health check: it neither loads the model nor sends anything anywhere.
+        The request is a plain ``GET`` to loopback, so a machine without Ollama gets a
+        refused connection immediately rather than a stalled start-up.
+        """
+        url = self._ollama_tags_url()
+        try:
+            with urllib.request.urlopen(url, timeout=OLLAMA_PROBE_TIMEOUT_S) as response:
+                status = getattr(response, "status", None) or response.getcode()
+        except Exception as exc:  # noqa: BLE001 - any failure means "not available here"
+            self.notes.append(f"No local Ollama server at {url} ({type(exc).__name__}).")
+            return False
+
+        if status != 200:
+            self.notes.append(f"Ollama at {url} answered HTTP {status}.")
+            return False
+
+        self._ollama_model = OLLAMA_MODEL
+        self._ollama_url = OLLAMA_BASE_URL.rstrip("/")
+        self.notes.append(
+            f"Using the local Ollama server at {self._ollama_url} with model "
+            f"{self._ollama_model} — on-device, no torch required."
+        )
+        return True
+
     def _try_init_hf_api(self) -> bool:
         """Attach to the Hugging Face Inference API. Requires HF_TOKEN."""
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -270,6 +347,8 @@ class GemmaLLM:
         try:
             if backend == "transformers":
                 result = self._generate_transformers(system, user)
+            elif backend == "ollama":
+                result = self._generate_ollama(system, user)
             elif backend == "hf_api":
                 result = self._generate_hf_api(system, user)
             else:
@@ -371,6 +450,37 @@ class GemmaLLM:
             self._chat_shape_index = None
             return self._build_chat_inputs(system, user)
         return self._processor(f"{system}\n\n{user}", return_tensors="pt")
+
+    def _generate_ollama(self, system: str, user: str) -> str:
+        """One turn through the local Ollama server's OpenAI-compatible endpoint.
+
+        Standard library only — no SDK, no extra dependency to install before the demo
+        runs. ``stream`` is off so the whole reply arrives as one JSON document, and
+        ``temperature`` is 0 for the same reason it is elsewhere: triage should be
+        reproducible.
+        """
+        payload = json.dumps(
+            {
+                "model": self._ollama_model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0,
+                "stream": False,
+            }
+        ).encode("utf-8")
+
+        request = urllib.request.Request(
+            f"{self._ollama_url}/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_S) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        return (data["choices"][0]["message"]["content"] or "").strip()
 
     def _generate_hf_api(self, system: str, user: str) -> str:
         try:
@@ -607,8 +717,6 @@ def _find_time(text: str) -> Optional[str]:
 
 def _heuristic_triage(user: str) -> str:
     """Classify an email with keyword scoring and emit contract-valid JSON."""
-    import json
-
     fields = _parse_email_block(user)
     subject = fields["subject"] or "(no subject)"
     body = fields["body"]

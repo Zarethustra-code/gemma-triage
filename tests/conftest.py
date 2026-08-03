@@ -42,6 +42,28 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("DO_NOT_TRACK", "1")
 
 
+@pytest.fixture(autouse=True)
+def offline_ollama(monkeypatch):
+    """Pin the Ollama tier off, for the same reason the environment above is pinned.
+
+    ``auto`` probes a local Ollama server, and a developer who has one running would
+    otherwise get a different backend than CI does: the selection tests would resolve
+    to ``ollama`` instead of ``heuristic``, and the no-network tests would record a
+    loopback connection. Neither is a real failure, and neither should be a real pass.
+
+    Only the *probe* is stubbed. ``tests/test_ollama.py`` captures the genuine method at
+    import time and re-installs it over this stub, so the backend itself is still tested
+    end to end against a fake ``urlopen``.
+    """
+    from agent.llm import GemmaLLM
+
+    def unavailable(self) -> bool:
+        self.notes.append("No local Ollama server (pinned off for the test suite).")
+        return False
+
+    monkeypatch.setattr(GemmaLLM, "_try_init_ollama", unavailable)
+
+
 # ---------------------------------------------------------------------------
 # Shared spies
 # ---------------------------------------------------------------------------

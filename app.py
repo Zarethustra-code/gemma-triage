@@ -156,6 +156,13 @@ def status_bar_html() -> str:
             "🔒",
             "LOCAL processing — Gemma 4 runs on this device, so email content stays here.",
         )
+    elif llm.active_backend == "ollama":
+        icon, lock, note = (
+            "🟢",
+            "🔒",
+            "LOCAL processing — Gemma 4 runs on this device through a local Ollama "
+            "server, so email content stays here.",
+        )
     elif llm.active_backend == "hf_api":
         icon, lock, note = (
             "🟡",
@@ -718,15 +725,17 @@ def build_ui() -> gr.Blocks:
 
         with gr.Accordion("⚙️ Engine settings & backend transparency", open=False):
             gr.Markdown(
-                "`GEMMA_BACKEND=auto` tries **transformers** (on-device) → **heuristic** "
-                "(on-device). It only considers **hf_api** — which sends email content to "
-                "an external inference provider — when `ALLOW_REMOTE_INFERENCE=true`. "
-                "Selecting `hf_api` here is an explicit request for remote processing and "
-                "is always honoured. Change the tier, then rebuild."
+                "`GEMMA_BACKEND=auto` tries **transformers** (on-device) → **ollama** "
+                "(on-device, via a local Ollama server on `OLLAMA_BASE_URL`) → "
+                "**heuristic** (on-device). It only considers **hf_api** — which sends "
+                "email content to an external inference provider — when "
+                "`ALLOW_REMOTE_INFERENCE=true`. Selecting `hf_api` here is an explicit "
+                "request for remote processing and is always honoured. Change the tier, "
+                "then rebuild."
             )
             with gr.Row():
                 backend_choice = gr.Dropdown(
-                    choices=["auto", "transformers", "hf_api", "heuristic"],
+                    choices=["auto", "transformers", "ollama", "hf_api", "heuristic"],
                     value=os.environ.get("GEMMA_BACKEND", "auto"),
                     label="Backend",
                 )
