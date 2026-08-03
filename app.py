@@ -27,7 +27,7 @@ import gradio as gr
 _LAUNCH_PARAMS = set(inspect.signature(gr.Blocks.launch).parameters)
 _STYLE_ON_LAUNCH = {"css", "theme"} <= _LAUNCH_PARAMS
 
-from agent import GemmaLLM, TriageAgent
+from agent import GemmaLLM, TriageAgent, tools
 from agent.tools import STATUS_APPROVED, STATUS_CREATED, STATUS_FAILED, STATUS_PREPARED
 from agent.triage import ProcessedEmail, inbox_stats, sort_results
 
@@ -37,6 +37,20 @@ SAMPLE_INBOX = APP_DIR / "data" / "sample_inbox.json"
 #: Size of the pre-allocated result row pool. Gradio needs a fixed component graph,
 #: so rows are created once and shown/hidden per run.
 MAX_ROWS = 14
+
+#: Components per result row, in the order ``build_ui`` creates them and ``render_row``
+#: / ``blank_row`` fill them:
+#:
+#:   group, header, accordion, detail, reply, tone, regenerate button,
+#:   regenerate status, draft button, draft status, row state
+#:
+#: Gradio needs a fixed-width output tuple, so this number is asserted in the tests: a
+#: row that gains or loses a component and forgets one of the two fillers fails loudly.
+ROW_WIDGETS = 11
+
+#: Default tone offered by every row's regenerate control. The vocabulary itself lives
+#: in ``agent.tools.VALID_TONES`` — there is no second list.
+DEFAULT_TONE = "professional"
 
 #: Per-category presentation. Solid badges stay legible in both light and dark themes.
 CATEGORY_STYLE: Dict[str, Dict[str, str]] = {
@@ -285,6 +299,43 @@ def create_gmail_draft(emails: Any, index: int, reply_text: str) -> str:
     )
 
 
+def regenerate_handler(
+    state: Any, tone: str, current_reply: str
+) -> Tuple[str, str]:
+    """Rewrite ONE row's reply in a new tone, using ONLY the reply-writing Gemma call.
+
+    The whole point is what it does not do. It never re-triages the inbox — no
+    ``process_inbox``, no ``process_email``, no reclassification of anything — and it
+    never touches Gmail. It runs the second step of the agent loop again, for one
+    email, and hands the text back to the same editable textbox the user was already
+    looking at. Every other row is untouched because a row's context arrives in its own
+    ``gr.State`` and the only output is its own textbox.
+
+    Returns ``(reply_text, status_line)``. On any failure the current reply is returned
+    unchanged, so a bad generation can never wipe text the user has written.
+    """
+    if not state or not isinstance(state, dict) or not state.get("email"):
+        return current_reply, "Nothing to regenerate yet."
+
+    if ENGINE.agent is None:
+        return current_reply, f"Engine unavailable: {ENGINE.error}"
+
+    tone = tools.normalize_tone(tone)
+    try:
+        text = tools.regenerate_reply(
+            ENGINE.llm, state["email"], tone, state.get("decision_summary")
+        )
+    except Exception:  # noqa: BLE001 - a failed rewrite must not clear the textbox
+        traceback.print_exc()
+        return current_reply, "❌ The reply could not be regenerated. See the server log."
+
+    return (
+        text,
+        f"Reply regenerated in a {tone} tone on `{ENGINE.llm.active_backend}`. "
+        "Edit it freely — nothing was drafted or sent.",
+    )
+
+
 def load_demo(_: Any = None) -> Tuple[List[Dict[str, Any]], str]:
     emails = load_sample_inbox()
     if not emails:
@@ -409,8 +460,13 @@ def blank_row() -> List[Any]:
         gr.update(label="Details"),
         gr.update(value=""),
         gr.update(value="", visible=False),
+        gr.update(value=DEFAULT_TONE, visible=False),
         gr.update(visible=False),
         gr.update(value="", visible=False),
+        gr.update(visible=False),
+        gr.update(value="", visible=False),
+        # A blank row owns no email, so its regenerate button has nothing to act on.
+        None,
     ]
 
 
@@ -431,15 +487,27 @@ def render_row(item: ProcessedEmail, position: int) -> List[Any]:
         else gr.update(value="", visible=False)
     )
 
+    tone = DEFAULT_TONE
+    payload = item.reply_payload or {}
+    if payload.get("tone") in tools.VALID_TONES:
+        # Start the dropdown on the tone Gemma actually chose for this email.
+        tone = payload["tone"]
+
     return [
         gr.update(visible=True),
         gr.update(value=header_html(item, position)),
         gr.update(label=label),
         gr.update(value=detail_html(item)),
         reply_update,
+        # Rewriting a reply only makes sense where there is a reply.
+        gr.update(value=tone, visible=has_reply),
+        gr.update(visible=has_reply),
+        gr.update(value="", visible=has_reply),
         # The draft button only exists where there is a reply to draft.
         gr.update(visible=has_reply),
         gr.update(value="", visible=False),
+        # This row's own context, read by nothing but this row's regenerate button.
+        {"email": item.email, "decision_summary": item.decision.summary},
     ]
 
 
@@ -596,6 +664,7 @@ def build_ui() -> gr.Blocks:
         # --- pre-allocated result rows ---------------------------------
         row_components: List[Any] = []
         draft_bindings: List[Tuple[int, Any, Any, Any]] = []
+        regen_bindings: List[Tuple[Any, Any, Any, Any, Any]] = []
         for i in range(MAX_ROWS):
             with gr.Group(visible=False) as group:
                 head = gr.HTML()
@@ -607,16 +676,40 @@ def build_ui() -> gr.Blocks:
                         visible=False,
                         interactive=True,
                         info=(
-                            "Edit freely. Nothing is sent automatically — the button below "
-                            "creates a Gmail *draft* from exactly this text."
+                            "Edit freely. Nothing is sent automatically — 🔁 rewrites this "
+                            "text in the tone you pick, and 📧 creates a Gmail *draft* from "
+                            "exactly what is in the box."
                         ),
                     )
+                    with gr.Row():
+                        tone_choice = gr.Dropdown(
+                            choices=list(tools.VALID_TONES),
+                            value=DEFAULT_TONE,
+                            label="Reply tone",
+                            visible=False,
+                            interactive=True,
+                            scale=2,
+                        )
+                        regen_btn = gr.Button(
+                            "🔁 Regenerate reply", size="sm", visible=False, scale=1
+                        )
+                    regen_status = gr.Markdown(visible=False)
                     draft_btn = gr.Button(
                         "📧 Create Gmail Draft", size="sm", visible=False, variant="secondary"
                     )
                     draft_status = gr.Markdown(visible=False)
-            row_components.extend([group, head, accordion, detail, reply, draft_btn, draft_status])
+            #: This row's email + triage summary. Scoped to the row, so the regenerate
+            #: button never has to look anything up in a shared list.
+            row_state = gr.State(None)
+            row_components.extend(
+                [
+                    group, head, accordion, detail, reply,
+                    tone_choice, regen_btn, regen_status,
+                    draft_btn, draft_status, row_state,
+                ]
+            )
             draft_bindings.append((i, draft_btn, reply, draft_status))
+            regen_bindings.append((row_state, tone_choice, regen_btn, reply, regen_status))
 
         with gr.Accordion("🧠 Raw agent trace (the JSON Gemma actually produced)", open=False):
             trace = gr.Code(
@@ -661,6 +754,18 @@ def build_ui() -> gr.Blocks:
         triage_outputs = [status, display_state, overview, trace, *row_components]
 
         run_btn.click(fn=run_triage, inputs=[inbox_state], outputs=triage_outputs)
+
+        # One regenerate handler per row, wired to that row and nothing else. The inputs
+        # name only this row's state, tone and textbox; the outputs name only this row's
+        # textbox and status line. `triage_outputs` appears in neither, so pressing the
+        # button reruns the reply-writing step for one email — the inbox is not
+        # reclassified, no other row moves, and nothing is drafted or sent.
+        for row_state, tone_choice, regen_btn, reply_box, regen_status in regen_bindings:
+            regen_btn.click(
+                fn=regenerate_handler,
+                inputs=[row_state, tone_choice, reply_box],
+                outputs=[reply_box, regen_status],
+            )
 
         # One click handler per row. Each closes over its own row index and reads the
         # *edited* textbox, so the draft is whatever the user actually approved.

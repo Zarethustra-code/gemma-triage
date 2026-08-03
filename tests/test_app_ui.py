@@ -256,10 +256,17 @@ def test_nothing_in_a_triage_run_claims_an_external_record_was_created(monkeypat
 
 
 def test_build_outputs_matches_the_component_graph():
-    """Gradio needs a fixed-width output tuple; a row-shape change must fail loudly."""
+    """Gradio needs a fixed-width output tuple; a row-shape change must fail loudly.
+
+    A row is 11 wide: group, header, accordion, detail, reply, tone, regenerate button,
+    regenerate status, draft button, draft status, row state. Both fillers have to
+    agree with that number and with each other.
+    """
+    assert app.ROW_WIDGETS == 11
+
     outputs = app.build_outputs([], 0, "status")
-    assert len(outputs) == 4 + app.MAX_ROWS * 7
-    assert len(app.blank_row()) == 7
+    assert len(outputs) == 4 + app.MAX_ROWS * app.ROW_WIDGETS
+    assert len(app.blank_row()) == app.ROW_WIDGETS
 
 
 def test_build_outputs_exposes_the_displayed_email_order():
